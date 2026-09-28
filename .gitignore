@@ -1,0 +1,18 @@
+# 密钥 —— 绝不进仓库
+.env
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 评测报告 / 记忆文件（本地产物，不进仓库）
+reports/
+data/memory.json
+
+# 向量索引（体积大，能从知识库重新生成，不进仓库）
+index/
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store

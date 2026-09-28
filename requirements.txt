@@ -1,0 +1,10 @@
+# kb-agent 依赖
+# 安装：pip install -r requirements.txt
+#
+# 说明：
+#   openai  —— 调 DeepSeek（对话）和阿里云 DashScope（向量）都用 OpenAI 兼容接口
+#   jieba   —— BM25 检索的分词（中文分词）
+#   其余全是 Python 标准库，无需额外安装。
+
+openai>=1.0.0
+jieba>=0.42.1
