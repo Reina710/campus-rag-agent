@@ -1,4 +1,4 @@
-# kb-agent 依赖
+# campus-rag-agent 依赖
 # 安装：pip install -r requirements.txt
 #
 # 说明：
