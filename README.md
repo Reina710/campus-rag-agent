@@ -95,17 +95,30 @@ embed 检索命中率更高（多捞回一道跨块题），但**回答通过率
 
 ## 快速开始
 
+### 方式一：网页版（推荐，点开即用）
+
+```bash
+pip install flask                # 网页 demo 额外需要一个 flask
+python web_demo.py               # 或双击 run_web.bat
+```
+
+浏览器打开 `http://127.0.0.1:8000`，输入问题回车即可。页面会同时展示**答案 + 本轮检索命中的知识块（含相关度）**，顶部还钉了四条核心评测数字。
+
+> 网页 demo 只是把命令行的 `input()` 换成浏览器输入框，核心的 Agent 逻辑（ReAct 循环 / 检索 / 生成）一行没改。
+
+### 方式二：命令行
+
 ```bash
 pip install -r requirements.txt   # 只依赖 openai + jieba，其余全是标准库
 cp .env.example .env              # 填 DEEPSEEK_KEY 和 DASHSCOPE_KEY
 ```
 
-然后：
-
 ```bash
 双击 run.bat        # 对话（/hits 看检索命中了哪几块，/history /clear）
 双击 run_eval.bat   # 跑评测，结果落盘 reports/
 ```
+
+> 需要跑通完整对话/向量检索时，才需要填 `.env` 里的两个密钥（DeepSeek + DashScope）。评测数据已落盘在 `reports/`，纯审读代码和结论无需密钥。
 
 ---
 

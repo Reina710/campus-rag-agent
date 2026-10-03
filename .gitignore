@@ -16,3 +16,8 @@ index/
 .vscode/
 .idea/
 .DS_Store
+
+# 本地调试产生的临时日志
+_pip_*.log
+_flask_*.log
+_webdemo.log
