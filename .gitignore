@@ -5,10 +5,15 @@
 __pycache__/
 *.pyc
 
-# 评测报告 / 记忆文件（本地产物，不进仓库）
-reports/
+# 评测报告（本地全量产物不进仓库，只保留最终三份原始输出）
+reports/*
+!reports/final/
+!reports/final/*
+# 会话记忆（本地产物）
 data/memory.json
 data/memory/
+
+# 测试缓存
 tests/__pycache__/
 
 # 向量索引（体积大，能从知识库重新生成，不进仓库）
