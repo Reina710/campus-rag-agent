@@ -103,6 +103,9 @@ embed 检索命中率更高（多召回一道跨块题），但回答通过率�
 4. **tool_call_id 无法跨会话持久化**：将 tool 中间产物持久化到文件后，重启导致引用失效。持久化仅保存干净的问答对。
 5. **向量检索开销优化**：缓存、批量请求、索引落盘三层优化，冷启动请求数从 37 次降至 2 次。
 6. **全局单例会话会串话**：初版 Web 服务用一个全局 agent，所有访客共用同一份 `messages`，第二个用户能看到第一个用户的上下文。改为按 cookie 分配会话、记忆按会话分文件，并用两个独立客户端做隔离验收。
+7. **流式只解决一半问题，剩下一半是冷启动**：接入 SSE 后首字节仍有 11.3 秒——同一台机器第二次请求只要 1.4 秒。差的这 10 秒来自 jieba 词典加载（约 1 秒）、块向量首次从索引补齐要联网 embed、到模型服务的第一条 TLS 连接。把预热挪到启动阶段后，首字降到约 2 秒、命中块 1.4 秒就显示。**用户感知的等待不是总耗时，是"第一屏有东西"的那一刻。**
+8. **探针不能拿依赖状态做判断**：`/health` 缺 key 时返回 `degraded`，如果直接拿它当容器探针，平台会把"欠费"当成"进程挂了"反复重启——重启一百次也不会好。所以拆成 `/livez`（进程活着）和 `/readyz`（知识库非空），依赖状态只给监控看。
+9. **流式下"已显示的内容"可能是错的**：Agent 模式里模型会先说一句"我查一下资料"再去调工具，这句话会作为正文增量推给前端。如果不管它，用户会看到"思考"和"答案"粘在一起。协议里加了一个 `reset` 事件撤回——验收测试真的抓到了这条路径（`status > delta > reset > hits > done`），不是纸上设计。
 
 ## 快速开始
 
@@ -136,33 +139,39 @@ python src/eval_pipeline.py --split dev       # 五方案对照·调参集
 python src/eval_pipeline.py --split holdout   # 五方案对照·独立评测集
 ```
 
+CI 每次 push 会跑一遍离线门禁（不联网、不需要密钥）：`python experiments/ci_gate.py`，
+freq / BM25 的 Top-1 低于 74% / 81% 就判定退化。
+
 最终评测的原始输出保存在 `reports/final/`（调参集 137 题 / 独立集 62 题 / 全量 199 题三份），审读代码与结论无需配置密钥。
 
 ## 部署
 
-### Docker
+完整步骤见 [DEPLOY.md](DEPLOY.md)（含反向代理、环境变量、上线检查清单、排障对照表）。
+这里只放最小可跑路径：
 
 ```bash
-docker build -t campus-rag-agent .
-docker run -p 8000:8000 \
-  -e DEEPSEEK_KEY=... \
-  -e DASHSCOPE_KEY=... \
-  campus-rag-agent
+cp .env.example .env          # 填 DEEPSEEK_KEY / DASHSCOPE_KEY / APP_SECRET
+docker compose up -d --build
+curl -s localhost:8000/readyz
 ```
 
-生产启动方式为单进程多线程（`gunicorn -w 1 --threads 16`）。
+生产启动方式为单进程多线程（`gunicorn -w 1 --threads 16`），容器以非 root 运行。
 
 ### 服务端行为
 
 | 能力 | 实现 |
 |---|---|
 | 会话隔离 | 按 cookie 分配会话，历史按会话落盘（`data/memory/<session_id>.json`），访客之间不共享上下文 |
-| 并发 | 每会话一把锁，同一用户的并发请求串行处理，避免对话历史被交叉写入 |
-| 降级 | rerank 失败回退 RRF 顺序；向量服务失败回退 BM25；模型调用超时重试 2 次，仍失败返回可读提示而非 500 |
+| 并发 | 每会话一把锁，同一用户并发请求串行；全局并发闸门（默认 8）满了直接 503，不排队 |
+| 流式 | `POST /ask_stream` 返回 SSE，先给 `status`/`hits` 再逐段吐 `delta`，支持 `reset` 撤回思考内容 |
+| 降级 | rerank 失败回退 RRF 顺序；向量服务失败回退 BM25；模型超时返回可读提示而非 500 |
 | 限流 | 同一 IP 每分钟 12 次，超限返回 429 |
-| 健康检查 | `GET /health` 返回知识库块数、会话数、依赖配置状态 |
+| 启动自检 | 知识库为 0 块、检索器名字写错、目录不可写 → 拒绝启动；缺 key 只告警 |
+| 预热 | 启动时初始化 jieba 词典、算好块向量，避免第一个访客等冷启动 |
+| 健康检查 | `/livez` 看进程、`/readyz` 看能否服务（知识库非空）、`/health` 给监控看依赖状态 |
+| 可观测 | 一行一个 JSON 的日志（带 `rid` 可串一次请求）+ `/metrics`（Prometheus 文本） |
 
-为什么是单进程：会话状态在进程内存中，多 worker 时同一用户的两次请求可能落到不同进程，表现为刷新后历史丢失。要横向扩容需把会话移到 Redis 等共享存储。
+为什么是单进程：会话状态在进程内存中，多 worker 时同一用户的两次请求可能落到不同进程，表现为刷新后历史丢失。要横向扩容需把会话移到 Redis，路线写在 DEPLOY.md 第 8 节。
 
 ### 验收
 
@@ -170,7 +179,8 @@ docker run -p 8000:8000 \
 python tests/test_online.py http://127.0.0.1:8000
 ```
 
-检查健康状态、会话内记忆、访客隔离、限流四项，会真实调用模型（约 10 秒）。
+15 项：探针分工、404 是否返回 JSON、`X-Request-Id`、会话内记忆、访客隔离、
+流式事件顺序、流式正文与最终答案一致性、限流。会真实调用模型（约 15 秒）。
 
 ## 技术栈
 
@@ -181,9 +191,9 @@ Python 3.11+ · DeepSeek · 阿里云 text-embedding-v3 · gte-rerank-v2 · jieb
 ## 目录结构
 
 ```
-src/        核心代码（agent / retriever / rerank / sessions / memory / 评测）
+src/        核心代码（agent / retriever / rerank / sessions / obs / 自检 / 评测）
 tests/      上线验收脚本
 demos/      演示脚本
-data/       知识库 + 注入攻击样本
-reports/    评测报告
+data/       知识库 + 注入攻击样本 + 首页展示的评测汇总
+reports/    评测报告（final/ 下是最终三份原始输出）
 ```

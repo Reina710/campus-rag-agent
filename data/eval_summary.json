@@ -1,0 +1,13 @@
+{
+  "_comment": "首页展示用的评测数字。由 src/eval_pipeline.py 的结果手工同步，改口径时只改这一个文件，避免页面上的数字和 README 各说各话。",
+  "updated": "2026-10-23",
+  "questions": 199,
+  "blocks": 54,
+  "top1": 96.0,
+  "top3": 100.0,
+  "mrr": 0.98,
+  "holdout_questions": 62,
+  "holdout_top1": 96.8,
+  "baseline_top1": 89.9,
+  "cross_block": "0/2 → 2/2"
+}

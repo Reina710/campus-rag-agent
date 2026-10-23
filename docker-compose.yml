@@ -1,0 +1,33 @@
+# 本地/单机跑法：docker compose up -d --build
+# 目的只是让"换一台机器能起来"，不等于对外发布。
+
+services:
+  app:
+    build: .
+    image: campus-rag-agent:local
+    container_name: campus-rag-agent
+    env_file:
+      - .env
+    environment:
+      PORT: "8000"
+      # 没有 TLS 时必须为 0，否则浏览器不存 cookie，表现为"每次刷新换会话"
+      COOKIE_SECURE: "0"
+      LOG_JSON: "1"
+      WARMUP: "1"
+      # 单进程的线程数与并发闸门，二者关系见 Dockerfile 注释
+      THREADS: "16"
+      MAX_CONCURRENT_ASKS: "8"
+    ports:
+      # 只绑本机：给反向代理用，别让 8000 直接暴露在公网
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+    # 会话与记忆都落盘到 data/，容器重建不丢历史
+    volumes:
+      - ./data/memory:/app/data/memory
+      - ./index:/app/index

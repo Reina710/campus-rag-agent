@@ -227,6 +227,30 @@ def save_index():
         json.dump(_block_vec_cache, f, ensure_ascii=False)
 
 
+def prune_index(blocks):
+    """丢掉不属于当前知识库的向量。
+
+    索引的 key 是 title+text，改了知识库后旧 key 不会被命中，但会一直留在
+    json 里——文件只涨不降，自检每次启动都会报"数量不一致"。
+    这里按当前块集合裁一遍，返回裁掉多少条。
+    """
+    keep = {b["title"] + b["text"] for b in blocks}
+    stale = [k for k in _block_vec_cache if k not in keep]
+    for k in stale:
+        del _block_vec_cache[k]
+    return len(stale)
+
+
+def warm_up(blocks):
+    """启动预热：把块向量算好并落盘。
+
+    不预热的话，第一个提问的用户要替所有人等冷启动（读索引 + 缺块要 embed）。
+    容器刚起来时最容易被第一个请求打到，这个代价应该由启动阶段承担。
+    """
+    _warm_up_blocks(blocks)
+    return len(_block_vec_cache)
+
+
 def _embed_block(b):
     """从一个块拿向量（只查缓存，不在这里发请求）。"""
     key = b["title"] + b["text"]
@@ -253,6 +277,9 @@ def _warm_up_blocks(blocks):
         if key not in _block_vec_cache:
             missing.append((key, b))
     if not missing:                   # 全在缓存或磁盘里，什么都不用做
+        # 但历史版本残留的向量要清掉，否则索引文件只涨不降
+        if prune_index(blocks):
+            save_index()
         return
 
     keys = [key for key, _ in missing]
@@ -260,6 +287,7 @@ def _warm_up_blocks(blocks):
     for (key, _), vec in zip(missing, vecs):
         _block_vec_cache[key] = vec   # 按顺序塞回缓存
 
+    prune_index(blocks)               # 顺手清掉旧版本块的向量
     save_index()                      # 算完立刻落盘
 
 

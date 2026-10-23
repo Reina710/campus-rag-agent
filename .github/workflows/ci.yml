@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 启动自检（不需要密钥）
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "src")
+          import selfcheck
+          report = selfcheck.run(strict=False)
+          for w in report["warnings"]:
+              print("warn:", w)
+          assert report["ok"], report["errors"]
+          print("blocks =", report["info"].get("blocks"))
+          PY
+
+      - name: 检索指标门禁（离线，不调外部接口）
+        run: python experiments/ci_gate.py
+
+      - name: 语法检查
+        run: python -m compileall -q src web_demo.py experiments tests

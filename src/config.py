@@ -44,6 +44,14 @@ def _get(key, default=""):
     return os.environ.get(key, default)
 
 
+def _int_env(key, default):
+    """环境变量转整数，非法值退回默认（部署平台填错不至于起不来）。"""
+    try:
+        return int(_get(key) or default)
+    except (TypeError, ValueError):
+        return default
+
+
 # ------------------------------------------------------------
 # 对话模型（DeepSeek）
 # ------------------------------------------------------------
@@ -148,20 +156,22 @@ SESSION_COOKIE = "kb_sid"    # 浏览器里存会话号的 cookie 名
 
 RATE_LIMIT_PER_MIN = 12      # 同一 IP 每分钟最多问几次（模型调用是花钱的）
 
+# 同时在跑的问答数上限。超过就直接 503，不排队——
+# 排队的结果是浏览器超时，用户不知道发生了什么；503 至少能读到"稍后再试"。
+# 取值要比 gunicorn 的 --threads 小：留出线程给健康检查、静态页面，
+# 否则健康检查会被长请求饿死，平台误判服务挂了。
+MAX_CONCURRENT_ASKS = _int_env("MAX_CONCURRENT_ASKS", 8)
+
+# 只在 HTTPS 下发 cookie。本地 http 调试必须关，否则浏览器直接不存 cookie，
+# 表现为"每次刷新都换会话"。生产由反向代理终结 TLS 后打开。
+COOKIE_SECURE = _get("COOKIE_SECURE") == "1"
+
 # 是否信任 X-Forwarded-For 里的客户端 IP。
 # 默认 False：这个头客户端自己也能伪造，直接信它等于限流形同虚设。
 # 只有确定跑在反向代理/负载均衡后面（代理会覆盖这个头）时才设 TRUST_PROXY=1。
 TRUST_PROXY = _get("TRUST_PROXY") == "1"
 
 APP_SECRET = _get("APP_SECRET")   # cookie 签名密钥，不设则每次启动随机生成
-
-
-def _int_env(key, default):
-    """环境变量转整数，非法值退回默认（部署平台填错不至于起不来）。"""
-    try:
-        return int(_get(key) or default)
-    except (TypeError, ValueError):
-        return default
 
 
 PORT = _int_env("PORT", 8000)

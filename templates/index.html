@@ -11,6 +11,7 @@
       --muted: #6b7280;
       --border: #e5e7eb;
       --bg: #f9fafb;
+      --radius: 10px;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -23,30 +24,27 @@
 
     header h1 { font-size: 26px; margin-bottom: 6px; }
     header .sub { color: var(--muted); font-size: 14px; }
-    header .meta {
-      margin-top: 12px; font-size: 13px; color: var(--muted);
-    }
+    header .meta { margin-top: 12px; font-size: 13px; color: var(--muted); }
     header .meta span {
       display: inline-block; background: #fff; border: 1px solid var(--border);
       border-radius: 6px; padding: 2px 10px; margin-right: 8px; margin-top: 6px;
     }
 
-    /* 评测数字卡 */
     .stats {
       display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-      gap: 12px; margin: 24px 0;
+      gap: 12px; margin: 24px 0 6px;
     }
     .stat {
-      background: #fff; border: 1px solid var(--border); border-radius: 10px;
-      padding: 14px 16px;
+      background: #fff; border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 14px 16px;
     }
-    .stat .num { font-size: 24px; font-weight: 700; color: var(--primary); }
+    .stat .num { font-size: 22px; font-weight: 700; color: var(--primary); }
     .stat .lbl { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .stats-note { font-size: 12px; color: var(--muted); margin-bottom: 18px; }
 
-    /* 提问区 */
     .chatbox {
-      background: #fff; border: 1px solid var(--border); border-radius: 12px;
-      padding: 20px; margin-top: 8px;
+      background: #fff; border: 1px solid var(--border);
+      border-radius: 12px; padding: 20px; margin-top: 8px;
     }
     #qa { min-height: 120px; }
     .q { margin-top: 16px; }
@@ -54,10 +52,18 @@
     .q .qtext {
       background: var(--bg); border-radius: 8px; padding: 10px 14px; font-size: 15px;
     }
+    .a { margin-top: 16px; }
     .a .who { font-weight: 700; color: var(--primary); font-size: 13px; margin-bottom: 4px; }
+    .a .status { font-size: 13px; color: var(--muted); }
     .a .atext {
       font-size: 15px; white-space: pre-wrap; word-break: break-word;
+      min-height: 1.6em;
     }
+    .a .atext.streaming::after {
+      content: "▍"; color: var(--primary); animation: blink 1s step-end infinite;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+
     .hits { margin-top: 12px; }
     .hits .hits-title { font-size: 13px; color: var(--muted); font-weight: 700; margin-bottom: 8px; }
     .hit {
@@ -67,10 +73,9 @@
     .hit .h-title { font-weight: 700; font-size: 13px; margin-bottom: 3px; }
     .hit .h-text { font-size: 13px; color: #374151; }
     .hit .h-score { font-size: 11px; color: var(--muted); margin-top: 3px; }
-    .err { color: #dc2626; font-size: 14px; margin-top: 12px; }
-    .loading { color: var(--muted); font-size: 14px; margin-top: 12px; }
 
-    /* 输入区 */
+    .err { color: #dc2626; font-size: 14px; margin-top: 12px; }
+
     .input-row { display: flex; gap: 10px; margin-top: 16px; }
     #question {
       flex: 1; padding: 12px 14px; font-size: 15px; border: 1px solid var(--border);
@@ -86,13 +91,20 @@
     .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
     .clear-link { float: right; font-size: 12px; color: var(--muted); cursor: pointer; margin-top: 8px; }
     .clear-link:hover { color: var(--primary); }
+
+    @media (max-width: 520px) {
+      .wrap { padding: 20px 14px 40px; }
+      header h1 { font-size: 21px; }
+      .input-row { flex-direction: column; }
+      #send { padding: 10px 0; }
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
     <header>
       <h1>校园知识库问答 Agent</h1>
-      <div class="sub">从零手写 RAG，用数据量化检索的每一层 —— 点下面随便问一个问题试试</div>
+      <div class="sub">检索的每一层都有量化评测 —— 在下面随便问一个问题试试</div>
       <div class="meta">
         <span>知识库 {{ blocks }} 块</span>
         <span>检索器 {{ retriever }}</span>
@@ -102,20 +114,33 @@
     </header>
 
     <div class="stats">
-      <div class="stat"><div class="num">96.3%</div><div class="lbl">向量检索 Top-1 命中</div></div>
-      <div class="stat"><div class="num">0.982</div><div class="lbl">向量 MRR（排名精度）</div></div>
-      <div class="stat"><div class="num">37 → 2</div><div class="lbl">向量检索请求次数优化</div></div>
-      <div class="stat"><div class="num">0/2 → 2/2</div><div class="lbl">跨块召回（字频 → 向量）</div></div>
+      <div class="stat">
+        <div class="num">{{ stats.top1 }}%</div>
+        <div class="lbl">检索 Top-1 命中（{{ stats.questions }} 题）</div>
+      </div>
+      <div class="stat">
+        <div class="num">{{ stats.holdout_top1 }}%</div>
+        <div class="lbl">独立集 Top-1（{{ stats.holdout_questions }} 题未参与调参）</div>
+      </div>
+      <div class="stat">
+        <div class="num">{{ stats.baseline_top1 }} → {{ stats.top1 }}</div>
+        <div class="lbl">rerank 精排前后 Top-1</div>
+      </div>
+      <div class="stat">
+        <div class="num">{{ stats.cross_block }}</div>
+        <div class="lbl">跨块召回（字频 → 向量）</div>
+      </div>
     </div>
+    <div class="stats-note">评测口径更新于 {{ stats.updated }}；完整报告在仓库 reports/final/。</div>
 
     <div class="chatbox">
       <span class="clear-link" onclick="clearMemory()">清空记忆</span>
       <div id="qa"></div>
       <div class="input-row">
-        <input id="question" type="text" placeholder="例如：选课时间是什么时候？" autocomplete="off">
+        <input id="question" type="text" placeholder="例如：选课时间是什么时候？" autocomplete="off" maxlength="200">
         <button id="send" onclick="ask()">发送</button>
       </div>
-      <div class="hint">试试问：「什么是 RAG」「找算法实习的时间线」「奖学金怎么申请」</div>
+      <div class="hint">试试问：「奖学金一等多少钱」「找算法实习的时间线」「延期毕业要办什么手续」</div>
     </div>
   </div>
 
@@ -125,34 +150,80 @@
     const send = document.getElementById('send');
 
     input.addEventListener('keydown', e => {
-      if (e.key === 'Enter') ask();
+      if (e.key === 'Enter' && !e.isComposing) ask();
     });
 
-    function ask() {
+    async function ask() {
       const q = input.value.trim();
       if (!q) return;
       appendQuestion(q);
       input.value = '';
       setBusy(true);
 
-      fetch('/ask', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: q }),
-      })
-      .then(r => r.json())
-      .then(data => {
-        setBusy(false);
-        if (data.error) {
-          appendError(data.error);
-        } else {
-          appendAnswer(data.answer, data.hits || []);
+      const view = appendAnswerShell();
+      let buffer = '';
+
+      function handle(ev) {
+        if (ev.type === 'hits') {
+          renderHits(view.hitsEl, ev.hits || []);
+        } else if (ev.type === 'status') {
+          view.statusEl.textContent = ev.text || '';
+        } else if (ev.type === 'delta') {
+          view.statusEl.textContent = '';
+          buffer += ev.text || '';
+          view.textEl.textContent = buffer;
+        } else if (ev.type === 'reset') {
+          // 模型先说了一段又转去调工具，那段是思考不是答案
+          buffer = '';
+          view.textEl.textContent = '';
+        } else if (ev.type === 'done') {
+          view.statusEl.textContent = '';
+          buffer = ev.answer || buffer;
+          view.textEl.textContent = buffer;
+        } else if (ev.type === 'error') {
+          view.statusEl.textContent = '';
+          view.textEl.textContent = '';
+          appendError(ev.error || '服务暂时不可用');
         }
-      })
-      .catch(err => {
+        scrollBottom();
+      }
+
+      try {
+        const resp = await fetch('/ask_stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question: q }),
+        });
+        if (!resp.ok || !resp.body) {
+          let msg = '请求失败（' + resp.status + '）';
+          try { const j = await resp.json(); msg = j.error || msg; } catch (e) {}
+          appendError(msg);
+          return;
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let pending = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          pending += decoder.decode(value, { stream: true });
+          let cut;
+          while ((cut = pending.indexOf('\n\n')) >= 0) {
+            const chunk = pending.slice(0, cut);
+            pending = pending.slice(cut + 2);
+            for (const line of chunk.split('\n')) {
+              if (!line.startsWith('data:')) continue;
+              try { handle(JSON.parse(line.slice(5).trim())); } catch (e) {}
+            }
+          }
+        }
+      } catch (err) {
+        appendError('连接中断：' + err);
+      } finally {
+        view.textEl.classList.remove('streaming');
         setBusy(false);
-        appendError('请求失败：' + err);
-      });
+      }
     }
 
     function appendQuestion(q) {
@@ -164,29 +235,34 @@
       scrollBottom();
     }
 
-    function appendAnswer(answer, hits) {
+    function appendAnswerShell() {
       const div = document.createElement('div');
       div.className = 'a';
-      div.style.marginTop = '16px';
-      div.innerHTML = '<div class="who">助手</div><div class="atext"></div>';
-      div.querySelector('.atext').textContent = answer;
+      div.innerHTML = '<div class="who">助手</div>' +
+        '<div class="status"></div>' +
+        '<div class="atext streaming"></div>' +
+        '<div class="hits"></div>';
       qa.appendChild(div);
+      return {
+        div: div,
+        statusEl: div.querySelector('.status'),
+        textEl: div.querySelector('.atext'),
+        hitsEl: div.querySelector('.hits'),
+      };
+    }
 
-      if (hits && hits.length) {
-        const hitsDiv = document.createElement('div');
-        hitsDiv.className = 'hits';
-        let html = '<div class="hits-title">本轮检索命中的知识块</div>';
-        hits.forEach(h => {
-          html += '<div class="hit">' +
-            '<div class="h-title">' + h.rank + '. ' + escapeHtml(h.title) + '</div>' +
-            '<div class="h-text">' + escapeHtml(h.text.slice(0, 120)) + (h.text.length > 120 ? '…' : '') + '</div>' +
-            '<div class="h-score">相关度 ' + h.score + '</div>' +
-            '</div>';
-        });
-        hitsDiv.innerHTML = html;
-        qa.appendChild(hitsDiv);
-      }
-      scrollBottom();
+    function renderHits(box, hits) {
+      if (!hits.length) { box.innerHTML = ''; return; }
+      let html = '<div class="hits-title">本轮检索命中的知识块</div>';
+      hits.forEach(h => {
+        const text = h.text || '';
+        html += '<div class="hit">' +
+          '<div class="h-title">' + h.rank + '. ' + escapeHtml(h.title || '') + '</div>' +
+          '<div class="h-text">' + escapeHtml(text.slice(0, 120)) + (text.length > 120 ? '…' : '') + '</div>' +
+          '<div class="h-score">相关度 ' + h.score + '</div>' +
+          '</div>';
+      });
+      box.innerHTML = html;
     }
 
     function appendError(msg) {
@@ -203,8 +279,7 @@
     }
 
     function clearMemory() {
-      fetch('/clear', { method: 'POST' })
-        .then(() => { qa.innerHTML = ''; });
+      fetch('/clear', { method: 'POST' }).then(() => { qa.innerHTML = ''; });
     }
 
     function escapeHtml(s) {

@@ -67,6 +67,28 @@ def _call_llm(messages, tool_choice="auto"):
     return _get_client().chat.completions.create(**kwargs)
 
 
+def _call_llm_stream(messages, tool_choice="auto"):
+    """流式版本：逐块产出 (正文增量, 工具调用增量列表)。
+
+    返回的是生成器，所以这里不吞异常——调用方的 try/except 才能看见超时。
+    正文增量可能是 None（纯工具调用的块里没有正文）；
+    工具调用增量是"碎片"，同一个调用的 id/name/arguments 会分多次到，
+    参数尤其是一段一段拼起来的，必须按 index 累积。
+    """
+    kwargs = {"model": config.CHAT_MODEL, "messages": messages, "stream": True}
+    if tool_choice == "auto":
+        kwargs["tools"] = tools.build_tools_json()
+        kwargs["tool_choice"] = "auto"
+    stream = _get_client().chat.completions.create(**kwargs)
+    for chunk in stream:
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            continue
+        delta = choices[0].delta
+        yield getattr(delta, "content", None), (getattr(delta, "tool_calls", None) or [])
+
+
+
 def _execute_tool(name, arguments):
     """
     执行一个工具，返回结果字符串。兜住三类"会崩"的情况，不把异常抛出去：
@@ -150,6 +172,23 @@ class KBAgent:
     def retrieve(self, question):
         """拿问题去知识库里找资料（rag 模式用）。"""
         return retriever.search(question, self.blocks, config.TOP_K)
+
+    def hits_payload(self):
+        """把上一轮命中的块整理成前端能直接渲染的结构。
+
+        放在 agent 上而不是 Web 层：流式和非流式两条路都要用，
+        写两份迟早会不一致。
+        """
+        out = []
+        for i, h in enumerate(self.last_hits):
+            b = h["block"]
+            out.append({
+                "rank": i + 1,
+                "score": round(h["score"], 4),
+                "title": b.get("title", ""),
+                "text": b.get("text", ""),
+            })
+        return out
 
     # ------------------------------------------------------------
     # 裁剪的边界保护
@@ -286,6 +325,165 @@ class KBAgent:
         except OSError:
             log.warning("save history failed, session=%s", self.session_id)
         return answer
+
+    # ------------------------------------------------------------
+    # 对外：流式问答
+    # ------------------------------------------------------------
+    def ask_stream(self, question):
+        """流式版 ask()：产出 (事件名, 数据) 二元组。
+
+        事件类型：
+            hits   本轮命中的知识块（前端先渲染这个，用户马上有反馈）
+            delta  正文增量
+            reset  撤回已显示的内容（模型先说了一段又转去调工具，那段只是思考）
+            done   完整答案（前端用它做最终校正）
+            error  兜底提示（不进脑，直接当答案显示）
+
+        为什么要 reset：流式下先把正文吐出去，后面才可能发现这一轮其实是
+        工具调用、那段正文只是"思考"。撤回比重来一次便宜，也比把思考当
+        答案留在屏幕上诚实。
+        """
+        before = len(self.messages)
+        try:
+            if config.AGENT_MODE == "tool":
+                yield from self._stream_tool_mode(question)
+            else:
+                yield from self._stream_rag_mode(question)
+        except Exception:
+            # 和 ask() 同一套收口：回滚本轮 + 修一次孤立 tool 消息
+            del self.messages[before:]
+            self._repair_tool_pairs()
+            log.exception("ask_stream failed, session=%s question=%.40s",
+                          self.session_id, question)
+            yield ("error", "抱歉，这次没能答上来（服务暂时不可用），请稍后再试一次。")
+            return
+
+        try:
+            self.save_history()
+        except OSError:
+            log.warning("save history failed, session=%s", self.session_id)
+
+    def _stream_rag_mode(self, question):
+        yield ("status", "正在检索知识库…")
+        hits = self.retrieve(question)
+        self.last_hits = hits
+        self.messages[0] = {
+            "role": "system",
+            "content": prompt_mod.build_system([h["block"] for h in hits]),
+        }
+        self.messages.append({"role": "user", "content": question})
+        self.trim_smart()
+
+        yield ("hits", self.hits_payload())
+
+        parts = []
+        for content, _tc in _call_llm_stream(self.messages, tool_choice=None):
+            if content:
+                parts.append(content)
+                yield ("delta", content)
+
+        answer = "".join(parts) or "（模型没有返回内容，请换个问法再试一次）"
+        self.messages.append({"role": "assistant", "content": answer})
+        yield ("done", answer)
+
+    def _stream_tool_mode(self, question):
+        """Agent 模式的流式：工具调用本身不流式，流的是"说给人听的那部分"。
+
+        难点在于：模型可能先输出一段正文，再决定调工具。正文已经在屏幕上
+        了怎么办？——发 reset 撤回，因为那段是思考不是答案。
+        """
+        self.messages[0] = {"role": "system", "content": prompt_mod.get_system_agent()}
+        self.messages.append({"role": "user", "content": question})
+
+        # 第一轮模型调用通常要 1~3 秒，这期间流里什么都还没有。
+        # 先给一句状态，前端就不会是一块空白在等。
+        yield ("status", "正在理解问题…")
+
+        for _ in range(config.MAX_LOOPS):
+            self._repair_tool_pairs()
+
+            parts = []
+            calls = {}      # index -> {id, name, arguments}，参数是分片拼起来的
+            for content, tc_deltas in _call_llm_stream(self.messages, tool_choice="auto"):
+                if content:
+                    parts.append(content)
+                    yield ("delta", content)
+                for tc in tc_deltas:
+                    slot = calls.setdefault(tc.index,
+                                            {"id": "", "name": "", "arguments": ""})
+                    if getattr(tc, "id", None):
+                        slot["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            slot["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            slot["arguments"] += fn.arguments
+
+            text = "".join(parts)
+
+            # 没有工具调用 -> 这段正文就是最终答案
+            if not calls:
+                answer = text or "（模型没有返回内容，请换个问法再试一次）"
+                self.messages.append({"role": "assistant", "content": answer})
+                self.trim_smart()
+                yield ("done", answer)
+                return
+
+            # 有工具调用 -> 刚吐出去的正文只是思考，撤回
+            if parts:
+                yield ("reset", "")
+
+            tool_calls = [
+                {
+                    "id": slot["id"] or "call_%d" % idx,
+                    "type": "function",
+                    "function": {
+                        # name 缺失说明分片没到齐，给个占位让工具层报"不存在"，
+                        # 总比抛 KeyError 把整轮打断好
+                        "name": slot["name"] or "",
+                        "arguments": slot["arguments"] or "{}",
+                    },
+                }
+                for idx, slot in sorted(calls.items())
+            ]
+            self.messages.append({
+                "role": "assistant",
+                "content": text,
+                "tool_calls": tool_calls,
+            })
+
+            for tc in tool_calls:
+                name = tc["function"]["name"]
+                args = tc["function"]["arguments"]
+                if name == "search_knowledge":
+                    yield ("status", "正在检索知识库…")
+                _think("调用工具 %s(%s)" % (name, args))
+                result = _execute_tool(name, args)
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                })
+                # 检索一执行完就把命中块推给前端，用户能立刻看到"它在查什么"
+                if name == "search_knowledge":
+                    self.last_hits = kb_tools.last_raw_hits()
+                    yield ("hits", self.hits_payload())
+
+        # 到上限还没收口 -> 逼它用已有信息回答（这一轮也流式）
+        self.messages.append({
+            "role": "user",
+            "content": "[已达到最大工具调用次数，请基于已有信息直接回答。]",
+        })
+        parts = []
+        for content, _tc in _call_llm_stream(self.messages, tool_choice=None):
+            if content:
+                parts.append(content)
+                yield ("delta", content)
+        answer = "".join(parts) or "（这次没能在限定轮次内答完，请把问题问得更具体些）"
+        self.messages.append({"role": "assistant", "content": answer})
+        self.trim_smart()
+        yield ("done", answer)
 
     # ------------------------------------------------------------
     # 模式一：rag（代码先检索）
