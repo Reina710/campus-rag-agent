@@ -32,7 +32,9 @@ expect 的两种写法（对应 evaluate.py 里的题库）：
     ["标题A", "标题B"] → 这道题有多个正确块（跨块题），recall@K 才有意义
 
 用法：
-    python eval_retrieval.py
+    python eval_retrieval.py                   # 全部题（214）
+    python eval_retrieval.py --split dev       # 只跑调参集（149）
+    python eval_retrieval.py --split holdout   # 只跑独立评测集（65）
 """
 
 import os
@@ -45,9 +47,29 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 import knowledge
 import retriever as R
-from evaluate import QUESTIONS
+import question_bank
 
 TOP_K = config.TOP_K
+
+# 评测子集：dev=调参集，holdout=独立评测集，all=全部（默认）。
+# 用 --split 切换，避免"在评测集上调参"导致数字虚高。
+SPLIT = "all"
+if "--dev" in sys.argv:
+    SPLIT = "dev"
+elif "--holdout" in sys.argv:
+    SPLIT = "holdout"
+elif "--split" in sys.argv:
+    _i = sys.argv.index("--split")
+    if _i + 1 >= len(sys.argv) or sys.argv[_i + 1] not in ("dev", "holdout", "all"):
+        raise SystemExit("--split 只能是 dev / holdout / all")
+    SPLIT = sys.argv[_i + 1]
+
+if SPLIT == "dev":
+    QUESTIONS = question_bank.dev_questions()
+elif SPLIT == "holdout":
+    QUESTIONS = question_bank.holdout_questions()
+else:
+    QUESTIONS = question_bank.QUESTIONS
 
 
 def _expects(item):
@@ -139,6 +161,8 @@ def show(res):
 def main():
     # 跑哪些检索器？embed/rrf 要联网花钱，freq/bm25 免费。
     # 默认全跑，拿完整对比。
+    print("评测子集 = %s（%d 题，其中 %d 道陷阱题不参与检索指标）"
+          % (SPLIT, len(QUESTIONS), sum(1 for q in QUESTIONS if q["expect"] == "（无）")))
     results = []
 
     print("\n>>> 跑字频检索（不花钱）...")
@@ -174,7 +198,7 @@ def main():
     # 落盘
     os.makedirs("reports", exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join("reports", "retrieval_%s.txt" % stamp)
+    path = os.path.join("reports", "retrieval_%s_%s.txt" % (SPLIT, stamp))
     with open(path, "w", encoding="utf-8") as f:
         f.write("检索层四方对比  Top-K=%d  块数=%d\n" % (TOP_K, len(knowledge.load_blocks())))
         f.write("%-8s %-8s %-8s %-9s %s\n" % ("检索器", "Top-1", "Top-K", "recall@K", "MRR"))

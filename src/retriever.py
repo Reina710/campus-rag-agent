@@ -8,6 +8,10 @@
     embed_search  向量版：按语义匹配，要联网
     rrf_search    融合版：bm25 + embed 两路排名融合
 
+第五个不是"又一个检索器"，而是一条流水线（见文件下半部分）：
+    hybrid_search 宽召回 -> RRF 合并 -> rerank 精排
+    它调用的还是上面几个，只是把"召回"和"排序"拆成两个阶段分别优化。
+
 都留着是为了能切换、能对比，评测模块会给出各自的命中率。
 """
 
@@ -111,41 +115,41 @@ def build_idf(blocks):
 
 
 def bm25_search(question, blocks, top_k):
-    """BM25 的简化版：分词 + TF×IDF + 长度归一化。
+    """BM25：TF 饱和 + IDF + 按平均块长归一。
 
-    和 freq_search 的差别三处：
-        1. 用 tokenize() 分词，不再逐字数
-        2. 每个词乘 IDF（稀有词权重大）
-        3. 长度归一化（长块不能因为词多就白占便宜）
+    注意这里和"TF×IDF÷块长"的区别，之前写成后者时踩过坑：
+        1. 词频要饱和——同一个词出现 10 次不该比出现 1 次重要 10 倍
+           （分母 f + k1*... 让增长变缓，不会无限累加）
+        2. 长度惩罚要看"这块比平均块长多少"，而不是"这块有多长"
+           （直接除块长会让 40 字的块无条件压过 200 字的块）
+    这两条合起来才是 BM25；少了任何一个，短块就会霸榜。
     """
     idf = build_idf(blocks)      # 先算好每个词的权重（只算一次）
 
-    # 把问题切成词，数每个词出现几次（TF）
-    q_tf = {}
-    for w in tokenize(question):
-        q_tf[w] = q_tf.get(w, 0) + 1
+    # 先切好每块的词和词频，顺便算平均块长（avgdl 是 BM25 的基准线）
+    docs = []
+    for b in blocks:
+        words = tokenize(b["title"] + b["text"])
+        tf = {}
+        for w in words:
+            tf[w] = tf.get(w, 0) + 1
+        docs.append((b, len(words), tf))
+    avgdl = sum(dl for _, dl, _ in docs) / float(max(len(docs), 1)) or 1.0
+
+    k1 = config.BM25_K1
+    b_param = config.BM25_B
+    q_terms = set(tokenize(question))     # 去重：同一个词问两遍不该算两份
 
     scored = []
-    for b in blocks:
-        b_words = tokenize(b["title"] + b["text"])
-        if not b_words:
-            scored.append({"block": b, "score": 0.0})
-            continue
-
-        # 块的 TF：每个词在这块里出现几次
-        b_tf = {}
-        for w in b_words:
-            b_tf[w] = b_tf.get(w, 0) + 1
-
-        # 打分：问题里每个词，用「词频 × IDF」累加
+    for block, dl, tf in docs:
+        norm = k1 * (1 - b_param + b_param * dl / avgdl)
         score = 0.0
-        for w, qtf in q_tf.items():
-            if w in b_tf:
-                score += idf.get(w, 0.0) * b_tf[w]
-
-        # 长度归一化：除以这块的词数
-        score /= len(b_words)
-        scored.append({"block": b, "score": score})
+        for w in q_terms:
+            f = tf.get(w, 0)
+            if f:
+                # 饱和项：f 从 1 涨到 2 收益明显，从 10 涨到 11 几乎没用
+                score += idf.get(w, 0.0) * f * (k1 + 1) / (f + norm)
+        scored.append({"block": block, "score": score})
 
     scored.sort(key=_score_of, reverse=True)
     return scored[:top_k]
@@ -317,9 +321,96 @@ def rrf_search(question, blocks, top_k):
 
 
 # ============================================================
+# 混合检索：宽召回 -> RRF 合并 -> rerank 精排
+# ============================================================
+def _rrf_merge(bm25_ranked, embed_ranked, candidates, k=60):
+    """在给定候选集上算 RRF 分并排序。
+
+    和 rrf_search 的区别：rrf_search 对"全部块"算分，这里只算候选池里的块。
+    不在某一路排名里的块（宽召回时可能发生）按"该路最后一名再往后一位"
+    记名次，贡献极小但不为零 —— 免得漏掉只在单路出现的正确答案。
+
+    ranked 列表用 id 建索引，避免 rrf_search 里那种逐块线性查找（O(n²)）。
+    """
+    r_bm = {h["block"]["id"]: i for i, h in enumerate(bm25_ranked, 1)}
+    r_em = {h["block"]["id"]: i for i, h in enumerate(embed_ranked, 1)}
+    far = max(len(bm25_ranked), len(embed_ranked)) + 1
+
+    scored = []
+    for b in candidates:
+        s = (1.0 / (r_bm.get(b["id"], far) + k)
+             + 1.0 / (r_em.get(b["id"], far) + k))
+        scored.append({"block": b, "score": s})
+    scored.sort(key=_score_of, reverse=True)
+    return scored
+
+
+def retrieve_pool(question, blocks, recall_k=None, merge_n=None):
+    """宽召回：两路各捞 recall_k 条，并集去重，再用 RRF 合并。
+
+    为什么先宽后窄：
+        如果一开始就只取 3 条，正确答案排第 4 就永远救不回来；
+        先捞 20 条（recall@20 通常接近 100%），把"能不能找到"和
+        "排得准不准"拆成两个问题，各自用合适的手段解决。
+
+    返回 RRF 分降序的候选列表（长度 <= merge_n），还没做精排。
+    """
+    if recall_k is None:
+        recall_k = config.RECALL_K
+    if merge_n is None:
+        merge_n = config.RERANK_N
+
+    # 两路都排全量：既然要算向量，不如一次排完，后面切片随便取
+    bm25_ranked = bm25_search(question, blocks, len(blocks))
+    embed_ranked = embed_search(question, blocks, len(blocks))
+
+    # 并集：任一路进前 recall_k 就留下
+    pool_ids = set()
+    for h in bm25_ranked[:recall_k]:
+        pool_ids.add(h["block"]["id"])
+    for h in embed_ranked[:recall_k]:
+        pool_ids.add(h["block"]["id"])
+    pool = [b for b in blocks if b["id"] in pool_ids]
+
+    return _rrf_merge(bm25_ranked, embed_ranked, pool)[:merge_n]
+
+
+def hybrid_search(question, blocks, top_k):
+    """三段流水线：宽召回 -> RRF 合并 -> rerank 精排 -> 取 Top-K。
+
+    两层降级（重要）：
+        第一层：rerank 失败（没装、超时、限流）-> 用 RRF 顺序，排序差一点但能答
+        第二层：连向量都不可用（key 失效、断网）-> 退回纯 BM25 字面检索
+
+    为什么兜底要放在这里而不是各路内部：
+        这是整条链路的出口。用户不关心里面哪一环挂了，只关心"还能不能答"。
+        组件内部各自兜底会让失败信号被吞掉，出口兜底至少能保证行为可预期。
+    """
+    try:
+        cands = retrieve_pool(question, blocks)
+    except Exception:
+        # 向量服务不可用的兜底。这里故意不细分异常类型：
+        # 到了出口这一层，任何原因都只对应一个动作——退到不依赖网络的检索。
+        return bm25_search(question, blocks, top_k)
+
+    if not cands:
+        return []
+
+    if config.RERANK_ENABLED:
+        import rerank as rerank_mod          # 延迟导入，避免循环依赖
+        reranked = rerank_mod.rerank(question, cands)
+        if reranked:                          # None / [] 都当作失败，降级
+            return reranked[:top_k]
+
+    return cands[:top_k]
+
+
+# ============================================================
 # 对外唯一入口：按配置选一个检索器
 # ============================================================
 def search(question, blocks, top_k):
+    if config.RETRIEVER == "hybrid":
+        return hybrid_search(question, blocks, top_k)
     if config.RETRIEVER == "rrf":
         return rrf_search(question, blocks, top_k)
     if config.RETRIEVER == "embed":

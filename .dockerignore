@@ -1,0 +1,27 @@
+# 不进镜像的东西
+
+# 密钥绝不进镜像（运行时用 -e 或平台的环境变量注入）
+.env
+
+# 本地产物
+__pycache__/
+*.pyc
+.pytest_cache/
+reports/
+index/
+data/memory/
+data/memory.json
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
+
+# 本地调试日志
+_*.log
+
+# 版本控制与容器自身
+.git/
+.gitignore
+Dockerfile
+.dockerignore

@@ -105,6 +105,21 @@ def load_blocks():
     return split_by_heading(raw)
 
 
+_CACHE = None
+
+
+def get_blocks():
+    """带缓存的版本：知识块是只读的，所有会话共用一份。
+
+    上线后每个访客都 load 一次是纯浪费。进程内缓存，重启即失效——
+    改了 knowledge.md 要重启才生效，这个代价换启动速度和内存是值的。
+    """
+    global _CACHE
+    if _CACHE is None:
+        _CACHE = load_blocks()
+    return _CACHE
+
+
 if __name__ == "__main__":
     # 直接运行本文件可查看切块结果
     bs = load_blocks()

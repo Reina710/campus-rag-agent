@@ -8,6 +8,8 @@ __pycache__/
 # 评测报告 / 记忆文件（本地产物，不进仓库）
 reports/
 data/memory.json
+data/memory/
+tests/__pycache__/
 
 # 向量索引（体积大，能从知识库重新生成，不进仓库）
 index/
@@ -17,7 +19,6 @@ index/
 .idea/
 .DS_Store
 
-# 本地调试产生的临时日志
-_pip_*.log
-_flask_*.log
-_webdemo.log
+# 本地调试产生的临时文件
+_*.log
+_*.txt

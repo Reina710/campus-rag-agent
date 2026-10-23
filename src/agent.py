@@ -14,6 +14,7 @@ Agent 主循环，有两种模式，区别在"谁来决定检索"：
 """
 
 import json
+import logging
 import config
 import knowledge
 import prompt as prompt_mod
@@ -26,7 +27,27 @@ import memory   # 持久化记忆用
 from openai import OpenAI
 
 
-client = OpenAI(api_key=config.DEEPSEEK_KEY, base_url=config.DEEPSEEK_BASE_URL)
+log = logging.getLogger("kb.agent")
+
+
+# ------------------------------------------------------------
+# 模型客户端：惰性创建
+# ------------------------------------------------------------
+# 为什么不写在模块顶层：健康检查必须能在"没配 key"的情况下也跑起来。
+# 顶层直接建 client 的话，缺 key 会让整个模块 import 失败，服务连启动都起不来。
+_client = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = OpenAI(
+            api_key=config.DEEPSEEK_KEY,
+            base_url=config.DEEPSEEK_BASE_URL,
+            timeout=config.LLM_TIMEOUT,        # 单次请求超时（秒）
+            max_retries=config.LLM_MAX_RETRIES,  # SDK 内置重试，只重试 5xx/超时
+        )
+    return _client
 
 
 def _call_llm(messages, tool_choice="auto"):
@@ -34,12 +55,16 @@ def _call_llm(messages, tool_choice="auto"):
     问一次模型。tool_choice 决定让不让它调工具：
         "auto" = 让它自己判断（Agent 模式用）
         None    = 纯问答，不给工具（RAG 模式用）
+
+    超时和重试交给 OpenAI SDK：timeout=N 控制单次等待上限，
+    max_retries=N 在超时/5xx 时按指数退避重试；4xx（key 错、参数错）
+    不重试，重试也没用。
     """
     kwargs = {"model": config.CHAT_MODEL, "messages": messages}
     if tool_choice == "auto":
         kwargs["tools"] = tools.build_tools_json()
         kwargs["tool_choice"] = "auto"
-    return client.chat.completions.create(**kwargs)
+    return _get_client().chat.completions.create(**kwargs)
 
 
 def _execute_tool(name, arguments):
@@ -91,9 +116,12 @@ def _think(text):
         print("  [agent] %s" % text, flush=True)
 
 
+# 知识块是只读的，所有会话共用同一份（缓存在 knowledge.get_blocks 里）。
 class KBAgent:
-    def __init__(self):
-        self.blocks = knowledge.load_blocks()
+    def __init__(self, session_id="default"):
+        # session_id 决定"这个 agent 的对话存到哪个文件"，也是隔离的最小单位
+        self.session_id = session_id
+        self.blocks = knowledge.get_blocks()
         self.messages = [{"role": "system", "content": ""}]
         self.last_hits = []          # 上一轮捞到了什么（给 /hits 看）
 
@@ -101,18 +129,20 @@ class KBAgent:
     # 持久化记忆：读回历史 / 存历史
     # ------------------------------------------------------------
     def load_history(self):
-        """启动时把上次存的历史读回来，接到 system 后面。"""
+        """启动时把本会话上次存的历史读回来，接到 system 后面。"""
         if not config.MEMORY_ENABLED:
             return
-        history = memory.load()
+        history = memory.load(self.session_id)
         if history:
             self.messages = [self.messages[0]] + history
+            # 从磁盘读回的可能是旧版本存下的不完整序列，先洗一遍
+            self._repair_tool_pairs()
 
     def save_history(self):
-        """退出时把整段对话历史存进文件（system 那条除外）。"""
+        """退出时把整段对话历史存进本会话自己的文件（system 那条除外）。"""
         if not config.MEMORY_ENABLED:
             return
-        memory.save(self.messages)
+        memory.save(self.messages, self.session_id)
 
     # ------------------------------------------------------------
     # 内部动作
@@ -121,17 +151,67 @@ class KBAgent:
         """拿问题去知识库里找资料（rag 模式用）。"""
         return retriever.search(question, self.blocks, config.TOP_K)
 
+    # ------------------------------------------------------------
+    # 裁剪的边界保护
+    # ------------------------------------------------------------
+    def _turn_starts(self):
+        """每条 user 消息的下标 = 一个完整对话轮次的起点。
+
+        裁剪必须以"轮次"为单位。按单条消息删会把
+        assistant(tool_calls) 和它后面的 tool 拆开，
+        而接口硬性要求 role=tool 必须紧跟带 tool_calls 的 assistant，
+        拆开后每次请求都 400，且坏状态只在内存里，磁盘上看不出来。
+        """
+        return [i for i, m in enumerate(self.messages) if m.get("role") == "user"]
+
+    def _repair_tool_pairs(self):
+        """丢掉没有对应 assistant(tool_calls) 的 tool 消息。
+
+        这是最后一道防线：无论历史是怎么坏的（裁剪、从磁盘读回、
+        中途异常回滚），只要在发请求前过一遍，就不会把非法序列送出去。
+        """
+        fixed = []
+        pending = set()          # 上一条 assistant 声明过的 tool_call id
+        dropped = 0
+        for m in self.messages:
+            r = m.get("role")
+            if r == "assistant" and m.get("tool_calls"):
+                pending = {tc.get("id") for tc in m["tool_calls"]}
+                fixed.append(m)
+            elif r == "tool":
+                if m.get("tool_call_id") in pending:
+                    fixed.append(m)
+                    pending.discard(m.get("tool_call_id"))
+                else:
+                    dropped += 1
+            else:
+                pending = set()
+                fixed.append(m)
+        if dropped:
+            log.warning("丢弃 %d 条孤立的 tool 消息（历史被裁剪拆散了），session=%s",
+                        dropped, self.session_id)
+            self.messages = fixed
+        return dropped
+
     def trim(self):
         """
-        按 token 预算裁剪：算出 messages 总 token，超过预算就从头删最老的
-        （跳过 system），直到回到预算以内。比"数条数"更准——一条 3000 字的
-        消息顶得上几十条短消息，光数条数会严重低估实际长度。
+        按 token 预算裁剪：算出 messages 总 token，超过预算就从最老的整轮开始删。
+
+        为什么按"轮次"删而不是按条删：
+            一轮问答在 Agent 模式下会展开成
+                user -> assistant(tool_calls) -> tool -> assistant(answer)
+            四条消息。逐条从头删，很可能正好删掉 assistant(tool_calls)
+            却留下 tool，接口直接拒绝（role=tool 找不到前置 tool_calls）。
+            按轮次删，切点永远落在 user 前面，配对天然完整。
         """
         budget = config.CONTEXT_MAX_TOKENS
-        # 至少保留 system + 最新一条，别删光
+        # 至少留 system + 最后一轮，别删光
         while len(self.messages) > 2 and \
                 token_estimator.estimate_messages(self.messages) > budget:
-            del self.messages[1]
+            starts = self._turn_starts()
+            if len(starts) <= 1:
+                break                    # 只剩最后一轮，再删就答不了
+            del self.messages[1:starts[1]]   # 删掉最早一整轮（system 除外）
 
     def trim_smart(self):
         """
@@ -149,12 +229,17 @@ class KBAgent:
         if token_estimator.estimate_messages(self.messages) <= budget:
             return   # 没超，什么都不做
 
-        if len(self.messages) <= 3:
+        # 切点必须落在"轮次起点"上。
+        # 原来用 messages[-2:] 取最新两条，如果倒数第二条正好是 tool，
+        # 切完就留下一条没有 tool_calls 的 tool 消息 —— 整段历史作废。
+        starts = self._turn_starts()
+        if len(starts) < 2:
             self.trim()
             return
 
-        old = self.messages[1:-2]     # 中间的老历史
-        recent = self.messages[-2:]   # 最新一轮，保留原样
+        cut = starts[-1]                  # 最后一轮的起点
+        old = self.messages[1:cut]        # 中间的老历史
+        recent = self.messages[cut:]      # 最新一轮（含它的全部 tool 往返）
 
         summary = compressor.compress_history(old)
         if summary.strip():
@@ -170,9 +255,37 @@ class KBAgent:
     # 对外：问一个问题，拿一个回答
     # ------------------------------------------------------------
     def ask(self, question):
-        if config.AGENT_MODE == "tool":
-            return self._ask_tool_mode(question)
-        return self._ask_rag_mode(question)
+        """对外唯一出口。任何异常都在这里收口，不往上抛。
+
+        为什么必须收口：Web 服务里一个没接住的异常就是 500，用户看到一片白。
+        模型超时、key 过期、网络抖动，这些的正确答案是"这句话没答上来"，
+        不是"整个服务坏了"。
+
+        出错时把这轮加进去的消息删掉：否则下一轮会带着半截对话继续，
+        模型看到"用户问了但助手没答"会自己编一个回答补上。
+        """
+        before = len(self.messages)
+        try:
+            if config.AGENT_MODE == "tool":
+                answer = self._ask_tool_mode(question)
+            else:
+                answer = self._ask_rag_mode(question)
+        except Exception:
+            del self.messages[before:]
+            # 坏消息可能在本轮之前就已经存在（比如裁剪留下的孤立 tool），
+            # 只回滚本轮删不掉它，下一轮还会同样 400。
+            self._repair_tool_pairs()
+            log.exception("ask failed, session=%s question=%.40s",
+                          self.session_id, question)
+            return "抱歉，这次没能答上来（服务暂时不可用），请稍后再试一次。"
+
+        # 每轮结束就落盘。Web 服务没有"退出"这个时机，
+        # 只在退出时保存的话，用户刷新页面历史就没了。
+        try:
+            self.save_history()
+        except OSError:
+            log.warning("save history failed, session=%s", self.session_id)
+        return answer
 
     # ------------------------------------------------------------
     # 模式一：rag（代码先检索）
@@ -205,6 +318,8 @@ class KBAgent:
         self.messages.append({"role": "user", "content": question})
 
         for _ in range(config.MAX_LOOPS):
+            # 发请求前最后过一遍：宁可丢掉一条孤立的 tool 消息，也不要整轮 400
+            self._repair_tool_pairs()
             resp = _call_llm(self.messages, tool_choice="auto")
             msg = resp.choices[0].message
 

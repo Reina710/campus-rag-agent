@@ -2,18 +2,31 @@
 """
 持久化记忆模块：让对话历史在程序重启后还在。
 
-存的是"干净的问答"（user 问了什么、assistant 最终答了什么），用
-json.dumps 写文件、json.loads 读回。存之前要先把 message 对象翻译成
-纯字典，否则 json 序列化会失败。
+上线后一个进程要服务多个用户，记忆必须按会话分开存：
+    data/memory/<session_id>.json
+否则 A 的聊天记录会被 B 读出来（这是上线前的头号问题）。
+
+安全：session_id 来自浏览器 cookie，属于不可信输入。这里只保留
+字母/数字/下划线/短横，再截断长度，防止 "../../xxx" 这类值把文件
+写到目录外面去。
 """
 
 import json
 import os
+import re
 import config
 
 
-# 记忆文件的位置（挂在项目根下）
-MEMORY_FILE = os.path.join(config.PROJECT_ROOT, "data", "memory.json")
+MEMORY_DIR = os.path.join(config.PROJECT_ROOT, "data", "memory")
+
+# 白名单过滤：不在这个集合里的字符一律丢掉
+_SAFE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _path(session_id="default"):
+    """会话 id -> 记忆文件路径。非法字符被剔除，空值退回 default。"""
+    sid = _SAFE.sub("", str(session_id or ""))[:40] or "default"
+    return os.path.join(MEMORY_DIR, sid + ".json")
 
 
 def _clean_message(m):
@@ -43,9 +56,9 @@ def _clean_message(m):
     }
 
 
-def save(messages):
+def save(messages, session_id="default"):
     """
-    把整段对话历史存进文件。
+    把整段对话历史存进"这个会话自己的"文件。
     只存"干净问答"（user/assistant 的最终文本），不存 system 和 tool 中间过程。
     """
     # 跳过第 0 条 system（每次启动会重建），并滤掉 tool 中间产物
@@ -60,19 +73,24 @@ def save(messages):
     if len(body) > max_msgs:
         body = body[-max_msgs:]
 
-    os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+    path = _path(session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # 先写临时文件再替换：进程被杀时不会留下半截 JSON（原子写）
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(body, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
-def load():
+def load(session_id="default"):
     """
-    读回历史记录。文件不存在或损坏时返回空列表（不崩，当没记忆）。
+    读回这个会话的历史。文件不存在或损坏时返回空列表（不崩，当没记忆）。
     """
-    if not os.path.exists(MEMORY_FILE):
+    path = _path(session_id)
+    if not os.path.exists(path):
         return []
     try:
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
             return data
@@ -81,24 +99,51 @@ def load():
         return []
 
 
-def clear():
-    """清空记忆文件。"""
-    if os.path.exists(MEMORY_FILE):
-        os.remove(MEMORY_FILE)
+def clear(session_id="default"):
+    """清空这个会话的记忆文件。"""
+    path = _path(session_id)
+    if os.path.exists(path):
+        os.remove(path)
 
 
-def has_history():
-    """有没有历史记录？"""
-    return bool(load())
+def has_history(session_id="default"):
+    """这个会话有没有历史记录？"""
+    return bool(load(session_id))
+
+
+def purge_older_than(days=7):
+    """清理很久没动过的记忆文件（部署环境的日常运维用）。
+
+    不清理的话，每个访客都会留下一个文件，磁盘只涨不降。
+    返回删掉的文件数。
+    """
+    import time
+    if not os.path.isdir(MEMORY_DIR):
+        return 0
+    deadline = time.time() - days * 86400
+    removed = 0
+    for name in os.listdir(MEMORY_DIR):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(MEMORY_DIR, name)
+        try:
+            if os.path.getmtime(path) < deadline:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 if __name__ == "__main__":
-    # 直接运行本文件：存一轮再读回来，验证翻译是否正确
+    # 直接运行本文件：存一轮再读回来，验证分会话隔离是否生效
     fake = [
         {"role": "system", "content": "你是助手"},
         {"role": "user", "content": "你好"},
         {"role": "assistant", "content": "你好！"},
     ]
-    save(fake)
-    print("存进去了，读回来：")
-    print(json.dumps(load(), ensure_ascii=False, indent=2))
+    save(fake, "selftest-a")
+    print("a 会话读回：", json.dumps(load("selftest-a"), ensure_ascii=False))
+    print("b 会话读回：", json.dumps(load("selftest-b"), ensure_ascii=False))
+    clear("selftest-a")
+    print("清理后 a 会话：", load("selftest-a"))

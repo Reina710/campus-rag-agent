@@ -2,9 +2,14 @@
 # 安装：pip install -r requirements.txt
 #
 # 说明：
-#   openai  —— 调 DeepSeek（对话）和阿里云 DashScope（向量）都用 OpenAI 兼容接口
-#   jieba   —— BM25 检索的分词（中文分词）
-#   其余全是 Python 标准库，无需额外安装。
+#   openai     —— 调 DeepSeek（对话）和阿里云 DashScope（向量）都用 OpenAI 兼容接口
+#   jieba      —— BM25 检索的分词（中文分词）
+#   dashscope  —— rerank（gte-rerank-v2）
+#   flask      —— Web 服务
+#   gunicorn   —— 生产环境 WSGI 服务器（Windows 没有，所以加了平台标记）
 
 openai>=1.0.0
 jieba>=0.42.1
+dashscope>=1.20.0
+flask>=3.0.0
+gunicorn>=21.2.0; sys_platform != "win32"
