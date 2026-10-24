@@ -8,6 +8,19 @@
 # 线程数默认 16：请求大部分时间在等模型返回（IO 密集），线程多才扛得住并发。
 # 注意 MAX_CONCURRENT_ASKS（默认 8）要小于线程数，给健康检查留出线程。
 
+# ---------- 前端构建 ----------
+# 单独一阶段：node 不进最终镜像，只把 dist 拷过去。
+# 前端构建失败不该阻断后端镜像 —— 所以产物没出来时，运行时会回退到旧模板。
+FROM node:20-alpine AS frontend
+
+WORKDIR /fe
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+# OUT_DIR 覆盖 vite.config.js 里的 ../static，让产物落在构建阶段自己的目录
+RUN OUT_DIR=dist npx vite build
+
+
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -24,6 +37,9 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY . .
+
+# 前端产物放在 COPY . . 之后，避免被本地 static/ 覆盖（.dockerignore 已排除 static/）
+COPY --from=frontend /fe/dist ./static
 
 # 不用 root 跑：容器里被拿到的代码不该有写系统目录的权限
 RUN useradd --create-home --uid 10001 appuser \

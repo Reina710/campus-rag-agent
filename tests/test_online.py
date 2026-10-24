@@ -10,6 +10,7 @@
     5. 流式问答的事件顺序与内容一致性
     6. 出错时返回的是 JSON 而不是 HTML 错误页
     7. 每个响应都带 request_id（出问题能对着日志查）
+    8. 首页返回的是前端构建产物（防"忘了 build"上线成旧页面）
 
 前置：先启动服务
     python web_demo.py
@@ -115,8 +116,18 @@ def ask_stream(op, question, timeout=120):
 def main():
     t0 = time.time()
 
-    # ---------- 1. 探针 ----------
+    # ---------- 0. 首页 ----------
+    # 前端由 frontend/ 用 Vite 构建到 static/，没构建过会回退到旧模板。
+    # 这一项专门防"上线了但忘了 build"——那种情况页面能开，只是回到旧版。
     op_a, jar_a = new_client()
+    status, page, _ = get(op_a, "/")
+    html = page.get("raw", "")
+    check("首页返回 200", status == 200)
+    check("首页是构建产物（引用 /static/assets/）",
+          "/static/assets/" in html,
+          "" if "/static/assets/" in html else "回退到了旧模板，先跑 npm run build")
+
+    # ---------- 1. 探针 ----------
     status, live, headers = get(op_a, "/livez")
     check("livez 返回 200", status == 200, str(live.get("status")))
 

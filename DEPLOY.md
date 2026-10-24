@@ -22,12 +22,18 @@
 ## 1. 本地验证（不花钱的部分）
 
 ```bash
+# 前端构建（产物直接落到 static/，Flask 托管；不构建会回退到旧模板）
+cd frontend && npm ci && npm run build && cd ..
+
 # 语法与配置自检：知识库能不能切块、检索器名字对不对、目录可不可写
 python -c "import sys; sys.path.insert(0,'src'); import selfcheck; print(selfcheck.run(strict=False))"
 
 # 离线回归：不调用任何外部接口，5 秒跑完，确认检索没退化
 python src/eval_pipeline.py --offline
 ```
+
+前端构建这一步容易被漏掉：漏了服务照样能起，只是页面变回旧版，`curl /` 也能通，
+所以后面验收里专门加了一项检查首页是否引用 `/static/assets/`。
 
 自检里 `errors` 非空会直接拒绝启动——**这是故意的**。容器起来但知识库是空的，
 比容器起不来的排查成本高得多。
@@ -36,10 +42,10 @@ python src/eval_pipeline.py --offline
 
 ```bash
 python web_demo.py            # 另开终端
-python tests/test_online.py   # 15 项，约 15 秒，花几分钱
+python tests/test_online.py   # 17 项，约 15 秒，花几分钱
 ```
 
-覆盖：探针、404 是否返回 JSON、request_id、会话隔离、流式事件顺序、
+覆盖：首页是否为构建产物、探针、404 是否返回 JSON、request_id、会话隔离、流式事件顺序、
 流式正文与最终答案一致、限流。
 
 ---
@@ -52,6 +58,9 @@ docker compose up -d --build
 docker compose logs -f
 curl -s localhost:8000/readyz | python -m json.tool
 ```
+
+镜像里前端会自动构建（Dockerfile 的 `frontend` 阶段），不需要本地装 node。
+代价是首次构建要多下 node 基础镜像和 npm 依赖；后续改后端代码时这一层走缓存。
 
 镜像里的关键设计：
 

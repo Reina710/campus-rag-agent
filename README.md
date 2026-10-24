@@ -113,10 +113,15 @@ embed 检索命中率更高（多召回一道跨块题），但回答通过率�
 
 ```bash
 pip install -r requirements.txt
+cd frontend && npm ci && npm run build && cd ..   # 首次需要构建前端，产物落到 static/
 python web_demo.py               # 或运行 run_web.bat
 ```
 
-浏览器打开 `http://127.0.0.1:8000`。页面展示答案及本轮检索命中的知识块（含相关度），顶部为四项核心评测数字。
+浏览器打开 `http://127.0.0.1:8000`。
+
+前端是独立的 React 工程（`frontend/`），构建产物输出到 `static/`，由 Flask 直接托管。
+没构建过也能启动——会回退到 `templates/index.html` 的旧版页面，功能可用但样式是早期的。
+前端开发时用 `npm run dev` 起 Vite 热更新，接口请求代理到 Flask（见 `vite.config.js`）。
 
 ### 方式二：命令行
 
@@ -157,6 +162,9 @@ curl -s localhost:8000/readyz
 
 生产启动方式为单进程多线程（`gunicorn -w 1 --threads 16`），容器以非 root 运行。
 
+镜像用多阶段构建：`node:20-alpine` 阶段跑 `npm ci && vite build`，产物拷进 python 镜像，
+node 不进最终镜像。所以构建镜像不需要本地装 node。
+
 ### 服务端行为
 
 | 能力 | 实现 |
@@ -179,12 +187,14 @@ curl -s localhost:8000/readyz
 python tests/test_online.py http://127.0.0.1:8000
 ```
 
-15 项：探针分工、404 是否返回 JSON、`X-Request-Id`、会话内记忆、访客隔离、
-流式事件顺序、流式正文与最终答案一致性、限流。会真实调用模型（约 15 秒）。
+17 项：首页是否为构建产物、探针分工、404 是否返回 JSON、`X-Request-Id`、会话内记忆、
+访客隔离、流式事件顺序、流式正文与最终答案一致性、限流。会真实调用模型（约 15 秒）。
 
 ## 技术栈
 
-Python 3.11+ · DeepSeek · 阿里云 text-embedding-v3 · gte-rerank-v2 · jieba · Flask · gunicorn
+后端：Python 3.11+ · DeepSeek · 阿里云 text-embedding-v3 · gte-rerank-v2 · jieba · Flask · gunicorn
+
+前端：React 18 · Vite 5 · Tailwind CSS（`frontend/`，产物为静态文件，无独立前端服务）
 
 不依赖 Agent 框架：ReAct 循环、检索器、上下文拼装、评测均为自行实现。
 
@@ -192,6 +202,7 @@ Python 3.11+ · DeepSeek · 阿里云 text-embedding-v3 · gte-rerank-v2 · jieb
 
 ```
 src/        核心代码（agent / retriever / rerank / sessions / obs / 自检 / 评测）
+frontend/   前端工程（React + Vite + Tailwind），构建产物输出到 static/
 tests/      上线验收脚本
 demos/      演示脚本
 data/       知识库 + 注入攻击样本 + 首页展示的评测汇总

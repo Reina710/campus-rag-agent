@@ -20,6 +20,10 @@ data/memory.json
 # 本地调试日志
 _*.log
 
+# 前端：源码进构建阶段，依赖和产物不进镜像（镜像里重新 npm ci + build）
+frontend/node_modules/
+static/
+
 # 版本控制与容器自身
 .git/
 .gitignore

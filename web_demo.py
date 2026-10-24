@@ -32,7 +32,7 @@ from pathlib import Path
 # 把 src/ 加进模块搜索路径，才能 import config / agent 等
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from flask import Flask, Response, g, jsonify, render_template, request, session
+from flask import Flask, Response, g, jsonify, render_template, request, send_file, session
 from werkzeug.exceptions import HTTPException
 
 import config
@@ -205,9 +205,18 @@ def _rate_limit():
 # ------------------------------------------------------------
 # 页面
 # ------------------------------------------------------------
+# 前端构建产物。frontend/ 用 Vite 构建到 static/，没有产物时回退到旧模板。
+_BUILT_INDEX = Path(__file__).resolve().parent / "static" / "index.html"
+
+
 @app.route("/")
 def index():
-    """首页：渲染 templates/index.html。"""
+    """首页：优先返回构建产物，没构建过就回退到 templates/index.html。
+
+    回退是为了部署时忘跑 npm build 不至于直接白屏——旧页面能用，只是不好看。
+    """
+    if _BUILT_INDEX.exists():
+        return send_file(str(_BUILT_INDEX))
     sess = store.get(_sid())
     stats = _load_eval_summary()
     return render_template("index.html",

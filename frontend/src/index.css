@@ -1,0 +1,86 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 全局底色。深色不是纯黑，纯黑在多数屏幕上会显得发灰、边缘发虚。 */
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: #05060a;
+  color: #e6eaf2;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(76, 201, 240, 0.28);
+}
+
+/* 细滚动条，默认那条白色滚动条一出戏就全毁了 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+/* 顶部渐隐网格：科技感来自这个，不是来自发光文字 */
+.grid-layer {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image: linear-gradient(to right, rgba(255, 255, 255, 0.055) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.055) 1px, transparent 1px);
+  background-size: 52px 52px;
+  -webkit-mask-image: radial-gradient(ellipse 85% 65% at 50% 0%, #000 30%, transparent 78%);
+  mask-image: radial-gradient(ellipse 85% 65% at 50% 0%, #000 30%, transparent 78%);
+}
+
+/* 顶部一条渐变细线，像设备通电 */
+.top-line {
+  background: linear-gradient(90deg, transparent, rgba(76, 201, 240, 0.55), rgba(123, 97, 255, 0.55), transparent);
+}
+
+/* 输入框聚焦时的光晕。box-shadow 不触发重排，比 border 动画稳 */
+.input-glow:focus-within {
+  border-color: rgba(76, 201, 240, 0.45);
+  box-shadow: 0 0 0 1px rgba(76, 201, 240, 0.18), 0 12px 40px -12px rgba(76, 201, 240, 0.35);
+}
+
+/* 流式输出的光标 */
+.caret::after {
+  content: '';
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  margin-left: 3px;
+  vertical-align: -0.15em;
+  background: linear-gradient(180deg, #4cc9f0, #7b61ff);
+  animation: caret 1s step-end infinite;
+}
+
+/* 回答里的行内代码 */
+.answer code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.07);
+}
+
+/* 长文段落的呼吸感 */
+.answer p + p {
+  margin-top: 0.7em;
+}
