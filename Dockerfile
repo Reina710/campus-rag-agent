@@ -34,6 +34,15 @@ WORKDIR /app
 
 # 先装依赖再拷代码：代码改动不会让依赖层缓存失效，重建快很多
 COPY requirements.txt .
+
+# 依赖源默认官方，可用 --build-arg 覆盖：
+#   docker build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple .
+# 直连 files.pythonhosted.org 在部分网络下会读超时（jieba 是 19MB 源码包），
+# 这不是镜像本身的问题，但卡在构建上一样跑不起来。
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_DEFAULT_TIMEOUT=60 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 RUN pip install -r requirements.txt
 
 COPY . .

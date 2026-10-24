@@ -12,8 +12,11 @@
 | 边界 | 后果 | 要突破得改什么 |
 |---|---|---|
 | 单进程（`-w 1`） | 只能靠线程扛并发，吃满一台机器的 CPU 就上不去 | 会话挪 Redis + 多 worker |
-| 会话在进程内存 | 重启后会话丢失（历史还在磁盘，但会话对象要重建），不能水平扩多实例 | 同上 |
+| 会话在进程内存 | 重启后会话对象重建：**历史能从磁盘读回**，但内存里的上一轮命中会丢；多实例时各进程各管一份锁，并发写同一个人会打架 | 同上 |
 | 指标在进程内 | 多实例时每个进程各算各的，`/metrics` 不能直接相加 | 接 Prometheus 多实例抓取 |
+
+> 实测：`docker restart` 之后用同一个 cookie 追问「我上一条问的是什么」，
+> 容器能答出上一轮的问题——历史在 `data/memory/<sid>.json` 里，重建会话时被读回来了。
 
 对"校园知识库问答"这个量级，单进程 16 线程足够；写清楚是为了不让人误以为它能直接扛全校流量。
 
@@ -62,6 +65,38 @@ curl -s localhost:8000/readyz | python -m json.tool
 镜像里前端会自动构建（Dockerfile 的 `frontend` 阶段），不需要本地装 node。
 代价是首次构建要多下 node 基础镜像和 npm 依赖；后续改后端代码时这一层走缓存。
 
+### 网络受限时怎么构建
+
+这一步会碰到两个和代码无关、但一样卡住构建的问题，实测过：
+
+1. **拉不到基础镜像**：`registry-1.docker.io` 在部分网络下解析到不可达地址，
+   报错是 `failed to resolve source metadata ... dial tcp ...`。
+   办法是先从可达的镜像源拉、再打回官方名，构建就不需要联网拉镜像：
+
+   ```bash
+   docker pull docker.1ms.run/library/python:3.11-slim
+   docker pull docker.1ms.run/library/node:20-alpine
+   docker tag docker.1ms.run/library/python:3.11-slim python:3.11-slim
+   docker tag docker.1ms.run/library/node:20-alpine node:20-alpine
+   ```
+
+2. **pip 下载依赖读超时**：报错是
+   `ReadTimeoutError: HTTPSConnectionPool(host='files.pythonhosted.org'...)`。
+   换国内源能解决一部分，但如果换源仍然超时，说明是通路问题而不是源的问题，
+   给构建挂上宿主机代理最直接（Docker Desktop 下宿主机是 `host.docker.internal`）：
+
+   ```bash
+   docker build \
+     --build-arg HTTPS_PROXY=http://host.docker.internal:7890 \
+     --build-arg HTTP_PROXY=http://host.docker.internal:7890 \
+     -t campus-rag-agent:local .
+   ```
+
+   也可以只换源：`--build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`。
+
+镜像构建好之后，`docker compose up -d` 会直接用这个镜像，不会再重新构建；
+只有显式加 `--build` 才会重建。
+
 镜像里的关键设计：
 
 - **非 root 运行**（uid 10001），容器被拿到代码也没有写系统目录的权限
@@ -70,6 +105,20 @@ curl -s localhost:8000/readyz | python -m json.tool
   否则滚动更新会把正在生成的流式回答切断
 - **`index/` 不进镜像**：容器首次启动会重新 embed 54 个块（约 6 次请求），
   用启动预热一次性付掉，不留给第一个访客
+
+### 实测记录
+
+以下数字来自 Windows 11 + Docker Desktop 29.8.2 的实际运行，不是估算：
+
+| 项 | 结果 |
+|---|---|
+| 镜像构建 | 成功，571 秒（依赖下载走宿主机代理），镜像 259 MB |
+| 启动到 `/readyz` 返回 200 | 挂载索引时 5 秒；不挂索引（需联网 embed 54 块）8 秒，其中向量 2.7 秒 |
+| `tests/test_online.py` | 17/17 通过，10.5 秒 |
+| 运行用户 | `docker exec id` → `uid=10001(appuser)`，非 root |
+| 容器健康 | `docker ps` 显示 `Up (healthy)`，健康检查打的是 `/livez` |
+| 重启后历史 | `docker restart` 后用同一 cookie 追问，能答出上一轮问题 |
+| 端口暴露 | 只绑 `127.0.0.1:8000`，宿主机外部访问不到 |
 
 ---
 

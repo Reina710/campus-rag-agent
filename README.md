@@ -165,6 +165,10 @@ curl -s localhost:8000/readyz
 镜像用多阶段构建：`node:20-alpine` 阶段跑 `npm ci && vite build`，产物拷进 python 镜像，
 node 不进最终镜像。所以构建镜像不需要本地装 node。
 
+这套容器链路已在 Windows + Docker Desktop 上实跑验证：镜像 259 MB，构建 571 秒，
+容器启动 5 秒（不挂索引时 8 秒，含联网 embed 54 个块），`tests/test_online.py` 17/17 通过。
+网络受限时构建会卡在拉基础镜像和下载依赖，绕法写在 [DEPLOY.md](DEPLOY.md#网络受限时怎么构建)。
+
 ### 服务端行为
 
 | 能力 | 实现 |
