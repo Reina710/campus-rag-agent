@@ -459,6 +459,7 @@ class KBAgent:
                 if name == "search_knowledge":
                     yield ("status", "正在检索知识库…")
                 _think("调用工具 %s(%s)" % (name, args))
+                kb_tools.set_history(self.messages)   # 查询改写做指代消解用
                 result = _execute_tool(name, args)
                 self.messages.append({
                     "role": "tool",
@@ -553,6 +554,7 @@ class KBAgent:
             # 逐个执行它要的工具，把结果回填（role="tool" + tool_call_id）
             for tc in msg.tool_calls:
                 _think("调用工具 %s(%s)" % (tc.function.name, tc.function.arguments))
+                kb_tools.set_history(self.messages)   # 查询改写做指代消解用
                 result = _execute_tool(tc.function.name, tc.function.arguments)
                 preview = result.replace("\n", " ")[:80]
                 _think("工具返回：%s%s" % (preview, "…" if len(result) > 80 else ""))

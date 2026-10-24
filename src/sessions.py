@@ -22,11 +22,16 @@ from agent import KBAgent
 
 
 class _Session:
-    """一个会话：一个 agent + 一把锁 + 最后一次活跃时间。"""
+    """一个对话：一个 agent + 一把锁 + 最后一次活跃时间。
 
-    def __init__(self, sid):
+    conv 是"同一浏览器下的第几段对话"。记忆文件按 "<sid>__<conv>" 存，
+    所以同一个浏览器可以有多段互不干扰的历史。
+    """
+
+    def __init__(self, sid, conv="default"):
         self.sid = sid
-        self.agent = KBAgent(sid)
+        self.conv = conv
+        self.agent = KBAgent("%s__%s" % (sid, conv))
         self.agent.load_history()
         self.lock = threading.Lock()
         self.last_seen = time.time()
@@ -42,17 +47,20 @@ class SessionStore:
         self.created = 0
         self.evicted = 0
 
-    def get(self, sid):
-        """取会话，没有就建。返回的对象自带 lock，调用方负责加锁。"""
+    def get(self, sid, conv="default"):
+        """取对话，没有就建。返回的对象自带 lock，调用方负责加锁。"""
         if not sid:
             sid = "anonymous"
+        if not conv:
+            conv = "default"
+        key = "%s__%s" % (sid, conv)
         now = time.time()
         with self._lock:
             self._evict(now)
-            s = self._items.get(sid)
+            s = self._items.get(key)
             if s is None:
-                s = _Session(sid)
-                self._items[sid] = s
+                s = _Session(sid, conv)
+                self._items[key] = s
                 self.created += 1
             s.last_seen = now
             return s
@@ -70,9 +78,22 @@ class SessionStore:
             self._items.pop(oldest, None)
             self.evicted += 1
 
-    def drop(self, sid):
+    def drop(self, sid, conv="default"):
+        key = "%s__%s" % (sid, conv or "default")
         with self._lock:
-            return self._items.pop(sid, None) is not None
+            return self._items.pop(key, None) is not None
+
+    def refresh_blocks(self):
+        """知识库变了（上传/删除文档），让所有活跃会话换一份新块。
+
+        不刷新的话：新文档只有新访客能查到，已经打开页面的人还是旧知识库，
+        表现为"我刚传了文件，怎么还是答不出来"。
+        """
+        import knowledge
+        blocks = knowledge.get_blocks()
+        with self._lock:
+            for s in self._items.values():
+                s.agent.blocks = blocks
 
     def stats(self):
         with self._lock:

@@ -97,12 +97,70 @@ def split_by_fixed(raw, size, overlap):
     return blocks
 
 
+# 上传文档目录：data/uploads/ 下的 .md / .txt 会被合并进知识库。
+UPLOAD_DIR = os.path.join(config.PROJECT_ROOT, "data", "uploads")
+
+ALLOWED_EXT = (".md", ".txt")
+
+
+def split_by_paragraph(raw, stem):
+    """纯文本（或没有标题结构的 markdown）：按空行分段，每段一块。"""
+    blocks = []
+    for i, para in enumerate(raw.split("\n\n"), 1):
+        text = para.strip()
+        if text:
+            blocks.append({"title": "%s · 第 %d 段" % (stem, i), "text": text})
+    return blocks
+
+
+def load_uploads():
+    """读 data/uploads/ 下所有 .md/.txt，切成块并标上来源文件名。
+
+    为什么单独标 source：
+        Web 端的文档管理需要按文件名统计块数、删除时找到对应块；
+        评测里也能看出"这块是内置的还是用户上传的"。
+    """
+    blocks = []
+    if not os.path.isdir(UPLOAD_DIR):
+        return blocks
+
+    for name in sorted(os.listdir(UPLOAD_DIR)):
+        path = os.path.join(UPLOAD_DIR, name)
+        low = name.lower()
+        if not os.path.isfile(path) or not low.endswith(ALLOWED_EXT):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read()
+        except OSError:
+            continue
+
+        stem = os.path.splitext(name)[0]
+        parts = split_by_heading(raw) if low.endswith(".md") else []
+        if not parts:      # .txt，或没有 ##/### 结构的 .md，按空行兜底
+            parts = split_by_paragraph(raw, stem)
+        for b in parts:
+            b["source"] = name
+            blocks.append(b)
+    return blocks
+
+
 def load_blocks():
-    """对外的唯一入口：读文件 + 切块，返回块列表。"""
+    """对外的唯一入口：内置 knowledge.md + data/uploads/ 下的文档，一起切块。"""
     raw = load_raw()
     if config.CHUNK_MODE == "fixed":
-        return split_by_fixed(raw, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
-    return split_by_heading(raw)
+        blocks = split_by_fixed(raw, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
+    else:
+        blocks = split_by_heading(raw)
+
+    for b in blocks:
+        b["source"] = "内置"
+    blocks += load_uploads()
+
+    # 合并后重新编号：上传文档的 id 会和内置块撞
+    for i, b in enumerate(blocks):
+        b["id"] = i
+    return blocks
 
 
 _CACHE = None

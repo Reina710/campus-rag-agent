@@ -20,9 +20,11 @@ Web 服务：把命令行问答换成一个网页。
 Redis——这个项目规模选前者。
 """
 
+import datetime
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import threading
@@ -36,9 +38,11 @@ from flask import Flask, Response, g, jsonify, render_template, request, send_fi
 from werkzeug.exceptions import HTTPException
 
 import config
+import docs
 import knowledge
 import memory
 import obs
+import question_bank
 import selfcheck
 from ratelimit import RateLimiter
 from sessions import SessionStore
@@ -56,7 +60,7 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,       # JS 读不到，降低 XSS 风险
     SESSION_COOKIE_SAMESITE="Lax",      # 跨站请求不带 cookie
     SESSION_COOKIE_SECURE=config.COOKIE_SECURE,   # 只在 HTTPS 下发送
-    MAX_CONTENT_LENGTH=8 * 1024,        # 请求体上限 8KB，防大包
+    MAX_CONTENT_LENGTH=1024 * 1024,     # 请求体上限 1MB：文档上传要留空间；提问长度另有校验
 )
 
 store = SessionStore()
@@ -189,6 +193,21 @@ def _validate(data):
     return question, None
 
 
+def _conv(data=None):
+    """取对话 id（同一浏览器下的第几段对话）。
+
+    它会拼进记忆文件名，属于不可信输入，只保留字母/数字/下划线/短横，
+    防止 "../" 这类值把文件写到目录外面。
+    """
+    raw = ""
+    if isinstance(data, dict):
+        raw = data.get("conv_id") or ""
+    if not raw:
+        raw = request.args.get("conv_id") or ""
+    raw = re.sub(r"[^A-Za-z0-9_-]", "", str(raw))[:32]
+    return raw or "default"
+
+
 def _rate_limit():
     """限流放在参数校验之前：恶意请求往往是"大量畸形请求"，
     先校验就会让它们白跑一遍逻辑，还占不到配额。"""
@@ -247,7 +266,7 @@ def ask():
         return _err("当前提问的人有点多，请稍后再试", 503)
 
     t0 = time.time()
-    sess = store.get(_sid())
+    sess = store.get(_sid(), _conv(data))
     try:
         # 同一会话串行：用户连点两次发送时，两个请求不能同时改 messages
         with sess.lock:
@@ -302,7 +321,7 @@ def ask_stream():
         METRICS.inc("concurrency_rejected_total")
         return _err("当前提问的人有点多，请稍后再试", 503)
 
-    sess = store.get(_sid())
+    sess = store.get(_sid(), _conv(data))
     rid = getattr(g, "rid", "")
     sid = sess.sid
 
@@ -360,12 +379,167 @@ def ask_stream():
 
 @app.route("/clear", methods=["POST"])
 def clear():
-    """清空当前会话的记忆，从头开始。"""
+    """清空当前对话的记忆，从头开始。"""
     sid = _sid()
-    memory.clear(sid)
-    store.drop(sid)
-    obs.log_event(log, "session_cleared", session=sid, rid=getattr(g, "rid", ""))
+    conv = _conv(request.get_json(silent=True) or {})
+    memory.clear("%s__%s" % (sid, conv))
+    store.drop(sid, conv)
+    obs.log_event(log, "session_cleared", session=sid, conv=conv,
+                  rid=getattr(g, "rid", ""))
     return jsonify({"ok": True})
+
+
+# ------------------------------------------------------------
+# 对话列表：同一个浏览器下可以有多段对话
+# ------------------------------------------------------------
+def _clean_conv(conv):
+    return re.sub(r"[^A-Za-z0-9_-]", "", str(conv or ""))[:32] or "default"
+
+
+@app.route("/api/conversations", methods=["GET"])
+def api_list_conversations():
+    """列出当前浏览器的所有对话（按最近更新倒序）。"""
+    return jsonify({"conversations": memory.list_conversations(_sid())})
+
+
+@app.route("/api/conversations", methods=["POST"])
+def api_new_conversation():
+    """新建对话：返回一个可用的 id，前端立刻切过去。"""
+    return jsonify({"id": secrets.token_hex(4)})
+
+
+@app.route("/api/conversations/<conv>/messages")
+def api_conv_messages(conv):
+    """读回某段对话的历史（前端切换到旧对话时用它恢复界面）。"""
+    conv = _clean_conv(conv)
+    return jsonify({
+        "conv_id": conv,
+        "messages": memory.load("%s__%s" % (_sid(), conv)),
+    })
+
+
+@app.route("/api/conversations/<conv>", methods=["DELETE"])
+def api_delete_conversation(conv):
+    conv = _clean_conv(conv)
+    sid = _sid()
+    memory.clear("%s__%s" % (sid, conv))
+    store.drop(sid, conv)
+    return jsonify({"ok": True})
+
+
+# ------------------------------------------------------------
+# 文档管理：上传 / 列表 / 删除
+# ------------------------------------------------------------
+@app.route("/api/docs", methods=["GET"])
+def api_list_docs():
+    """列出内置知识库 + 上传文档，各带块数。"""
+    return jsonify({
+        "docs": docs.list_docs(),
+        "blocks": len(knowledge.get_blocks()),
+    })
+
+
+@app.route("/api/docs", methods=["POST"])
+def api_upload_doc():
+    """上传一个 .md / .txt，合并进知识库并增量补向量。"""
+    blocked = _rate_limit()
+    if blocked:
+        return blocked
+
+    f = request.files.get("file")
+    if not f:
+        return _err("没有收到文件", 400)
+
+    ok, msg = docs.save(f.filename, f.read())
+    if not ok:
+        return _err(msg, 400)
+
+    store.refresh_blocks()          # 已经打开页面的会话也换新块
+    obs.log_event(log, "doc_uploaded", name=f.filename, rid=getattr(g, "rid", ""))
+    return jsonify({
+        "ok": True,
+        "message": msg,
+        "docs": docs.list_docs(),
+        "blocks": len(knowledge.get_blocks()),
+    })
+
+
+@app.route("/api/docs/<name>", methods=["DELETE"])
+def api_delete_doc(name):
+    """删除一个上传文档（内置知识库不可删）。"""
+    ok, msg = docs.remove(name)
+    if not ok:
+        return _err(msg, 404)
+
+    store.refresh_blocks()
+    obs.log_event(log, "doc_deleted", name=name, rid=getattr(g, "rid", ""))
+    return jsonify({
+        "ok": True,
+        "message": msg,
+        "docs": docs.list_docs(),
+        "blocks": len(knowledge.get_blocks()),
+    })
+
+
+@app.route("/api/reindex", methods=["POST"])
+def api_reindex():
+    """手动重建索引：改了数据文件、或怀疑索引脏了时用。"""
+    n = docs.rebuild()
+    store.refresh_blocks()
+    return jsonify({"ok": True, "blocks": n})
+
+
+# ------------------------------------------------------------
+# 反馈：点赞/点踩，落到 jsonl，作为 bad case 池
+# ------------------------------------------------------------
+FEEDBACK_PATH = Path(config.PROJECT_ROOT) / "data" / "feedback.jsonl"
+
+
+@app.route("/api/feedback", methods=["POST"])
+def api_feedback():
+    """记录一条反馈。down 的样本就是下一轮要重点看的 bad case。"""
+    data = request.get_json(silent=True) or {}
+    rating = data.get("rating")
+    if rating not in ("up", "down"):
+        return _err("rating 只能是 up / down", 400)
+
+    record = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "rating": rating,
+        "question": (data.get("question") or "")[:500],
+        "answer": (data.get("answer") or "")[:1000],
+        "request_id": (data.get("request_id") or "")[:40],
+        "session": _sid(),
+    }
+    FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(FEEDBACK_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    METRICS.inc("feedback_%s" % rating)
+    obs.log_event(log, "feedback", rating=rating, rid=getattr(g, "rid", ""))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/feedback/stats")
+def api_feedback_stats():
+    """反馈汇总：总数、好评率。首页不展示，给运维/分析用。"""
+    total = up = 0
+    if FEEDBACK_PATH.exists():
+        with open(FEEDBACK_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                total += 1
+                if rec.get("rating") == "up":
+                    up += 1
+    return jsonify({
+        "total": total,
+        "up": up,
+        "down": total - up,
+        "up_rate": round(up / total, 4) if total else None,
+    })
 
 
 # ------------------------------------------------------------
@@ -406,11 +580,34 @@ def health():
         "status": "degraded" if degraded else "ok",
         "uptime_seconds": int(time.time() - STARTED_AT),
         "blocks": len(knowledge.get_blocks()),
+        "docs": docs.count_docs(),
         "retriever": config.RETRIEVER,
         "llm_configured": bool(config.DEEPSEEK_KEY),
         "embedding_configured": bool(config.DASHSCOPE_KEY),
         "sessions": store.stats(),
         "warnings": _report["warnings"],
+    })
+
+
+@app.route("/api/stats")
+def api_stats():
+    """首页展示用的真实统计：块数、文档数、题库数、评测汇总。
+
+    前端不写死数字——知识库一上传，首页要跟着变。
+    """
+    summary = _load_eval_summary()
+    return jsonify({
+        "blocks": len(knowledge.get_blocks()),
+        "docs": docs.count_docs(),
+        "questions": len(question_bank.QUESTIONS),
+        "eval": {
+            "scored_questions": summary.get("questions"),
+            "top1": summary.get("top1"),
+            "top3": summary.get("top3"),
+            "holdout_questions": summary.get("holdout_questions"),
+            "holdout_top1": summary.get("holdout_top1"),
+            "updated": summary.get("updated"),
+        },
     })
 
 

@@ -24,8 +24,12 @@ _SAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 
 def _path(session_id="default"):
-    """会话 id -> 记忆文件路径。非法字符被剔除，空值退回 default。"""
-    sid = _SAFE.sub("", str(session_id or ""))[:40] or "default"
+    """会话 id -> 记忆文件路径。非法字符被剔除，空值退回 default。
+
+    支持复合 key（浏览器 sid + 会话 conv，形如 "abc__conv1"）：
+    这样同一个浏览器可以存多段对话，互不覆盖。
+    """
+    sid = _SAFE.sub("", str(session_id or ""))[:80] or "default"
     return os.path.join(MEMORY_DIR, sid + ".json")
 
 
@@ -50,9 +54,20 @@ def _clean_message(m):
     if content is None or (isinstance(content, str) and not content.strip()):
         return None   # 空内容也不存
 
+    content = content if isinstance(content, str) else str(content)
+
+    # 模型在答案尾部追加的"猜你想问"是展示用建议，不进历史——
+    # 存进去的话，读回来是一段死文字，还会被当成答案的一部分。
+    if role == "assistant":
+        idx = content.find("猜你想问")
+        if idx >= 0:
+            content = content[:idx].rstrip()
+        if not content:
+            return None
+
     return {
         "role": role,
-        "content": content if isinstance(content, str) else str(content),
+        "content": content,
     }
 
 
@@ -109,6 +124,39 @@ def clear(session_id="default"):
 def has_history(session_id="default"):
     """这个会话有没有历史记录？"""
     return bool(load(session_id))
+
+
+def list_conversations(sid):
+    """列出某个浏览器（sid）下所有对话。返回 [{id, title, updated, turns}]。
+
+    文件名约定：<sid>__<conv>.json。没有这个前缀的文件属于别的浏览器，不列。
+    """
+    if not os.path.isdir(MEMORY_DIR):
+        return []
+    prefix = _SAFE.sub("", str(sid or ""))[:80] + "__"
+    out = []
+    for name in os.listdir(MEMORY_DIR):
+        if not name.startswith(prefix) or not name.endswith(".json"):
+            continue
+        conv = name[len(prefix):-len(".json")]
+        path = os.path.join(MEMORY_DIR, name)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            updated = int(os.path.getmtime(path))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, list):
+            continue
+        first = next((m.get("content") for m in data if m.get("role") == "user"), "")
+        out.append({
+            "id": conv,
+            "title": (first or "新对话")[:24],
+            "updated": updated,
+            "turns": sum(1 for m in data if m.get("role") == "user"),
+        })
+    out.sort(key=lambda x: -x["updated"])
+    return out
 
 
 def purge_older_than(days=7):

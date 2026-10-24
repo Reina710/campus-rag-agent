@@ -13,6 +13,15 @@ reports/*
 data/memory.json
 data/memory/
 
+# 上传文档（运行时数据，clone 后只有内置 knowledge.md）
+data/uploads/
+
+# 用户反馈（运行时数据）
+data/feedback.jsonl
+
+# bad case 池报告（由 experiments/harvest_feedback.py 生成）
+data/bad_cases.md
+
 # 测试缓存
 tests/__pycache__/
 
@@ -32,3 +41,6 @@ static/
 _*.log
 _*.txt
 _*.png
+
+# 个人面试准备材料，不进公开仓库
+docs/面试讲稿.md

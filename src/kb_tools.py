@@ -7,9 +7,20 @@
 RAG Agent 的分水岭。
 """
 
+import config
 import retriever
 import tools
 import prompt as prompt_mod
+
+
+# 最近一次工具调用前，Agent 塞进来的对话历史（供指代消解用）。
+_HISTORY = []
+
+
+def set_history(messages):
+    """Agent 每次调工具前把最近几轮对话塞进来，供查询改写做指代消解。"""
+    global _HISTORY
+    _HISTORY = list(messages[-6:]) if messages else []
 
 
 @tools.agent_tool(
@@ -18,10 +29,28 @@ import prompt as prompt_mod
                 "返回最相关的几块资料。当你不确定答案、需要查资料时必须调用它。",
 )
 def search_knowledge(query: str) -> str:
-    """查知识库：拿 query 去检索，把 top 几块的标题和正文拼成一段文字返回。"""
+    """查知识库：先改写（多查询/指代消解），再逐路召回、按块合并。"""
     global LAST_RAW_HITS
     blocks = _get_blocks()
-    hits = retriever.search(query, blocks, _TOP_K)
+
+    # 查询改写：原问题 + 改写出的 2-3 个版本。开关关掉时就是单查询，
+    # 和旧行为完全一致。改写失败自动退回原问题，不影响主流程。
+    queries = [query]
+    if config.QUERY_REWRITE:
+        try:
+            import query_rewrite
+            queries = query_rewrite.rewrite(query, _HISTORY) or [query]
+        except Exception:
+            queries = [query]
+
+    # 多路召回：同一个块可能被多个查询命中，按 id 去重、保留最高分
+    merged = {}
+    for q in queries:
+        for h in retriever.search(q, blocks, _TOP_K):
+            bid = h["block"]["id"]
+            if bid not in merged or h["score"] > merged[bid]["score"]:
+                merged[bid] = h
+    hits = sorted(merged.values(), key=lambda x: -x["score"])[:_TOP_K]
     LAST_RAW_HITS = hits   # 记下原始结果，供评测统计命中用
 
     if not hits:
